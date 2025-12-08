@@ -17,10 +17,12 @@ using Sharp.Shared.Units;
 
 namespace RampFix;
 
-[StructLayout(LayoutKind.Sequential, Pack = 4)]
+[StructLayout(LayoutKind.Explicit, Pack = 4)]
 internal struct bbox_t
 {
+    [FieldOffset(0)]
     public Vector mins;
+    [FieldOffset(12)]
     public Vector maxs;
 }
 
@@ -33,11 +35,11 @@ public class RampFix : IModSharpModule
     private readonly IDetourHook      _categorizePositionHook;
     private readonly ILogger<RampFix> _logger;
 
-    private static unsafe delegate* unmanaged<nint, MoveData*, Vector*, GameTrace*, bool*, void>
+    private static unsafe delegate* unmanaged<nint, MoveData*, Vector*, CGameTrace*, bool*, void>
         CCSPlayer_MovementService_TryPlayerMoveOriginal;
     private static unsafe delegate* unmanaged<nint, MoveData*, bool, void> CCSPlayer_MovementService_CategorizePositionOrigin;
 
-    private static unsafe delegate* unmanaged<Vector*, Vector*, bbox_t*, CTraceFilter*, GameTrace*, void> TracePlayerBBox;
+    private static unsafe delegate* unmanaged<Vector*, Vector*, bbox_t*, CTraceFilter*, CGameTrace*, void> TracePlayerBBox;
 
     private readonly IGameData    _gameData;
     private readonly IHookManager _hookManager;
@@ -82,10 +84,10 @@ public class RampFix : IModSharpModule
             return false;
         }
 
-        TracePlayerBBox = (delegate* unmanaged<Vector*, Vector*, bbox_t*, CTraceFilter*, GameTrace*, void>) address;
+        TracePlayerBBox = (delegate* unmanaged<Vector*, Vector*, bbox_t*, CTraceFilter*, CGameTrace*, void>) address;
 
         _tryPlayerMoveHook.Prepare("CCSPlayer_MovementService::TryPlayerMove",
-                                   (nint) (delegate* unmanaged<nint, MoveData*, Vector*, GameTrace*, bool*, void>)
+                                   (nint) (delegate* unmanaged<nint, MoveData*, Vector*, CGameTrace*, bool*, void>)
                                    (&hk_CCSPlayer_MovementService_TryPlayerMove));
 
         _categorizePositionHook.Prepare("CCSPlayer_MovementService::CategorizePosition",
@@ -95,7 +97,7 @@ public class RampFix : IModSharpModule
         if (_tryPlayerMoveHook.Install())
         {
             CCSPlayer_MovementService_TryPlayerMoveOriginal
-                = (delegate* unmanaged<nint, MoveData*, Vector*, GameTrace*, bool*, void>) _tryPlayerMoveHook.Trampoline;
+                = (delegate* unmanaged<nint, MoveData*, Vector*, CGameTrace*, bool*, void>) _tryPlayerMoveHook.Trampoline;
         }
 
         if (_categorizePositionHook.Install())
@@ -103,19 +105,19 @@ public class RampFix : IModSharpModule
             CCSPlayer_MovementService_CategorizePositionOrigin
                 = (delegate* unmanaged<nint, MoveData*, bool, void>) _categorizePositionHook.Trampoline;
 
+            _hookManager.PlayerProcessMovePre.InstallForward(OnPreProcessMovement);
+            _hookManager.PlayerProcessMovePost.InstallForward(OnPostProcessMovement);
+
             return true;
         }
-
-        _hookManager.PlayerProcessMovePost.InstallForward(OnPostProcessMovement);
-        _hookManager.PlayerProcessMovePre.InstallForward(OnPreProcessMovement);
 
         return false;
     }
 
     public void Shutdown()
     {
-        _hookManager.PlayerProcessMovePost.RemoveForward(OnPostProcessMovement);
         _hookManager.PlayerProcessMovePre.RemoveForward(OnPreProcessMovement);
+        _hookManager.PlayerProcessMovePost.RemoveForward(OnPostProcessMovement);
 
         _tryPlayerMoveHook.Uninstall();
         _categorizePositionHook.Uninstall();
@@ -140,7 +142,7 @@ public class RampFix : IModSharpModule
         }
     }
 
-    private static unsafe bool IsValidMovementTrace(GameTrace* trace, bbox_t* bbox, CTraceFilter* filter)
+    private static unsafe bool IsValidMovementTrace(CGameTrace* trace, bbox_t* bbox, CTraceFilter* filter)
     {
         if (trace->StartInSolid)
         {
@@ -162,7 +164,7 @@ public class RampFix : IModSharpModule
             return false;
         }
 
-        var stuck = stackalloc GameTrace[1];
+        var stuck = stackalloc CGameTrace[1];
         TracePlayerBBox(&trace->EndPosition, &trace->EndPosition, bbox, filter, stuck);
 
         if (stuck->StartInSolid || stuck->Fraction < 1.0f - float.Epsilon)
@@ -205,7 +207,7 @@ public class RampFix : IModSharpModule
                                                 PlayerSlot       slot,
                                                 MoveData*        mv,
                                                 Vector*          pFirstDest,
-                                                GameTrace*       pFirstTrace)
+                                                CGameTrace*      pFirstTrace)
     {
         var timeLeft = _globalVars.FrameTime;
         var start    = mv->AbsOrigin;
@@ -218,25 +220,27 @@ public class RampFix : IModSharpModule
 
         var potentiallyStuck = false;
 
-        var pm     = stackalloc GameTrace[1];
-        var pierce = stackalloc GameTrace[1];
+        var pm     = stackalloc CGameTrace[1];
+        var pierce = stackalloc CGameTrace[1];
+        var test   = stackalloc CGameTrace[1];
 
-        var bbox = new bbox_t
-        {
-            mins = new (-16, -16, 0),
-            maxs = new (-16, -16, service.GetNetVar<bool>("m_bDucked") ? 54.0f : 72.0f),
-        };
+        var bbox = stackalloc bbox_t[1];
+        bbox->mins = new (-16, -16, 0);
+        bbox->maxs = new (-16, -16, service.GetNetVar<bool>("m_bDucked") ? 54.0f : 72.0f);
 
         var filter    = stackalloc CTraceFilter[1];
+
         var collision = pawn.GetCollisionProperty()!;
-        filter->QueryAttribute = RnQueryShapeAttr.PlayerMovement(collision.CollisionAttribute.InteractsWith);
+        var attribute = RnQueryShapeAttr.PlayerMovement(collision.CollisionAttribute.InteractsWith);
+        attribute.SetEntityToIgnore(pawn, 0);
+        filter->QueryAttribute = attribute;
         filter->Vtable         = (CTraceFilterVTableDescriptor*) CTraceFilterPlayerMovementCS_vtable;
 
         var numPlanes = 0;
 
         var planes = stackalloc Vector[5];
 
-        for (var bumpCount = 0; bumpCount < 8; bumpCount++)
+        for (var bumpCount = 0u; bumpCount < 4; bumpCount++)
         {
             end = start + (velocity * timeLeft);
 
@@ -246,24 +250,22 @@ public class RampFix : IModSharpModule
             }
             else
             {
-                TracePlayerBBox(&start, &end, &bbox, filter, pm);
+                TracePlayerBBox(&start, &end, bbox, filter, pm);
 
                 if (start == end)
                 {
                     continue;
                 }
 
-                var isValidTrace = IsValidMovementTrace(pm, &bbox, filter);
-
-                if (isValidTrace && Math.Abs(pm->Fraction - 1.0f) < float.Epsilon)
+                if (IsValidMovementTrace(pm, bbox, filter) && Math.Abs(pm->Fraction - 1.0f) < float.Epsilon)
                 {
                     break;
                 }
 
                 if (LastValidPlaneNormal[slot].Length() > float.Epsilon
-                    && (!isValidTrace
-                        || (pm->PlaneNormal.Dot(LastValidPlaneNormal[slot]) < RAMP_BUG_THRESHOLD)
-                        | (potentiallyStuck && pm->Fraction == 0.0f)))
+                    && (!IsValidMovementTrace(pm, bbox, filter)
+                        || pm->PlaneNormal.Dot(LastValidPlaneNormal[slot]) < RAMP_BUG_THRESHOLD
+                        || (potentiallyStuck && pm->Fraction == 0.0f)))
                 {
                     float[] offsets = [0.0f, -1.0f, 1.0f];
                     var     success = false;
@@ -289,11 +291,10 @@ public class RampFix : IModSharpModule
                                         continue;
                                     }
 
-                                    var test      = new GameTrace();
                                     var testStart = start + (offsetDirection * RAMP_PIERCE_DISTANCE);
-                                    TracePlayerBBox(&testStart, &start, &bbox, filter, &test);
+                                    TracePlayerBBox(&testStart, &start, bbox, filter, test);
 
-                                    if (!IsValidMovementTrace(&test, &bbox, filter))
+                                    if (!IsValidMovementTrace(test, bbox, filter))
                                     {
                                         continue;
                                     }
@@ -309,11 +310,11 @@ public class RampFix : IModSharpModule
 
                                     TracePlayerBBox(&ratioStart,
                                                     &ratioEnd,
-                                                    &bbox,
+                                                    bbox,
                                                     filter,
                                                     pierce);
 
-                                    if (!IsValidMovementTrace(pierce, &bbox, filter))
+                                    if (!IsValidMovementTrace(pierce, bbox, filter))
                                     {
                                         continue;
                                     }
@@ -323,8 +324,9 @@ public class RampFix : IModSharpModule
                                                      && pierce->PlaneNormal.Dot(LastValidPlaneNormal[slot])
                                                      >= RAMP_BUG_THRESHOLD;
 
-                                    hitNewPlane = pm->PlaneNormal.Dot(pierce->PlaneNormal)               < NEW_RAMP_THRESHOLD
-                                                  && LastValidPlaneNormal[slot].Dot(pierce->PlaneNormal) > NEW_RAMP_THRESHOLD;
+                                    hitNewPlane = pm->PlaneNormal.Dot(pierce->PlaneNormal) < NEW_RAMP_THRESHOLD
+                                                  && LastValidPlaneNormal[slot].Dot(pierce->PlaneNormal)
+                                                  > NEW_RAMP_THRESHOLD;
 
                                     goodTrace = MathF.Abs(pierce->Fraction - 1.0f) < float.Epsilon || validPlane;
 
@@ -336,30 +338,29 @@ public class RampFix : IModSharpModule
 
                                 if (goodTrace || hitNewPlane)
                                 {
-                                    var test = new GameTrace();
-                                    TracePlayerBBox(&pierce->EndPosition, &end, &bbox, filter, &test);
+                                    TracePlayerBBox(&pierce->EndPosition, &end, bbox, filter, test);
 
                                     *pm = *pierce;
 
-                                    Unsafe.AsRef(in pm->StartPosition) = start;
+                                    pm->StartPosition = start;
 
-                                    Unsafe.AsRef(in pm->Fraction)
+                                    pm->Fraction
                                         = Math.Clamp((pierce->EndPosition - pierce->StartPosition).Length()
                                                      / (end               - start).Length(),
                                                      0.0f,
                                                      1.0f);
 
-                                    Unsafe.AsRef(in pm->EndPosition) = test.EndPosition;
+                                    pm->EndPosition = test->EndPosition;
 
                                     if (pierce->PlaneNormal.LengthSqr() > 0.0f)
                                     {
-                                        Unsafe.AsRef(in pm->PlaneNormal) = pierce->PlaneNormal;
-                                        LastValidPlaneNormal[slot]       = pierce->PlaneNormal;
+                                        pm->PlaneNormal            = pierce->PlaneNormal;
+                                        LastValidPlaneNormal[slot] = pierce->PlaneNormal;
                                     }
                                     else
                                     {
-                                        Unsafe.AsRef(in pm->PlaneNormal) = test.PlaneNormal;
-                                        LastValidPlaneNormal[slot]       = test.PlaneNormal;
+                                        pm->PlaneNormal            = test->PlaneNormal;
+                                        LastValidPlaneNormal[slot] = test->PlaneNormal;
                                     }
 
                                     success            = true;
@@ -385,7 +386,7 @@ public class RampFix : IModSharpModule
                 numPlanes   =  0;
             }
 
-            if (Math.Abs(allFraction - 1.0f) < float.Epsilon)
+            if (allFraction == 1.0f)
             {
                 break;
             }
@@ -394,7 +395,7 @@ public class RampFix : IModSharpModule
 
             if (numPlanes >= 5 || (pm->PlaneNormal.Z >= 0.7f && velocity.Length2D() < 1.0f))
             {
-                velocity = new ();
+                velocity = emptyVector;
 
                 break;
             }
@@ -446,7 +447,7 @@ public class RampFix : IModSharpModule
                     // go along the crease
                     if (numPlanes != 2)
                     {
-                        velocity = new ();
+                        velocity = emptyVector;
 
                         break;
                     }
@@ -455,11 +456,12 @@ public class RampFix : IModSharpModule
                     float d;
                     dir.Normalize();
                     dir.Normalize();
-                    d = dir.Dot(velocity);
+                    d        =  dir.Dot(velocity);
+                    velocity *= d;
 
                     if (velocity.Dot(primalVelocity) < d)
                     {
-                        velocity = new ();
+                        velocity = emptyVector;
 
                         break;
                     }
@@ -471,20 +473,19 @@ public class RampFix : IModSharpModule
         TpmVelocity[slot] = velocity;
     }
 
+    private static readonly Vector emptyVector = new ();
+
     private static unsafe void PostTryPlayerMove(MoveData* mv, PlayerSlot slot)
     {
-        var normalizedTpmVelocity = TpmVelocity[slot];
-        normalizedTpmVelocity.Normalize();
+        var velocityHeavilyModified =
+            TpmVelocity[slot].Normalized().Dot(mv->Velocity.Normalized()) < RAMP_BUG_THRESHOLD
+            || (TpmVelocity[slot].Length()                            > 50.0f
+                && mv->Velocity.Length() / TpmVelocity[slot].Length() < RAMP_BUG_VELOCITY_THRESHOLD);
 
-        var normalizedVelocity = mv->Velocity;
-        normalizedVelocity.Normalize();
-
-        var heavilyModified = normalizedTpmVelocity.Dot(normalizedVelocity) < RAMP_BUG_THRESHOLD
-                              || (TpmVelocity[slot].Length()
-                                  > 50.0f
-                                  && mv->Velocity.Length() / TpmVelocity[slot].Length() < RAMP_BUG_VELOCITY_THRESHOLD);
-
-        if (OverridenTpm[slot] && heavilyModified && !TpmOrigin[slot].IsZero() && !TpmVelocity[slot].IsZero())
+        if (OverridenTpm[slot]
+            && velocityHeavilyModified
+            && TpmOrigin[slot]   != emptyVector
+            && TpmVelocity[slot] != emptyVector)
         {
             mv->AbsOrigin = TpmOrigin[slot];
             mv->Velocity  = TpmVelocity[slot];
@@ -492,11 +493,11 @@ public class RampFix : IModSharpModule
     }
 
     [UnmanagedCallersOnly]
-    private static unsafe void hk_CCSPlayer_MovementService_TryPlayerMove(nint       servicePtr,
-                                                                          MoveData*  mv,
-                                                                          Vector*    pFirstDest,
-                                                                          GameTrace* pFirstTrace,
-                                                                          bool*      pIsSurfing)
+    private static unsafe void hk_CCSPlayer_MovementService_TryPlayerMove(nint        servicePtr,
+                                                                          MoveData*   mv,
+                                                                          Vector*     pFirstDest,
+                                                                          CGameTrace* pFirstTrace,
+                                                                          bool*       pIsSurfing)
     {
         var service = _modSharp.CreateNativeObject<IPlayerMovementService>(servicePtr)!;
 
@@ -509,7 +510,8 @@ public class RampFix : IModSharpModule
         }
 
         var slot = controller.PlayerSlot;
-        DidTpm[slot] = true;
+        DidTpm[slot]       = true;
+        OverridenTpm[slot] = false;
 
         if (mv->Velocity.LengthSqr() == 0)
         {
@@ -549,26 +551,28 @@ public class RampFix : IModSharpModule
             goto original;
         }
 
-        var bbox = new bbox_t
-        {
-            mins = new (-16, -16, 0),
-            maxs = new (-16, -16, service.GetNetVar<bool>("m_bDucked") ? 54.0f : 72.0f),
-        };
+        var bbox = stackalloc bbox_t[1];
+        bbox->mins = new (-16, -16, 0);
+        bbox->maxs = new (-16, -16, service.GetNetVar<bool>("m_bDucked") ? 54.0f : 72.0f);
 
         var filter    = stackalloc CTraceFilter[1];
         var collision = pawn.GetCollisionProperty()!;
-        filter->QueryAttribute = RnQueryShapeAttr.PlayerMovement(collision.CollisionAttribute.InteractsWith);
-        filter->Vtable         = (CTraceFilterVTableDescriptor*) CTraceFilterPlayerMovementCS_vtable;
+        var attribute = RnQueryShapeAttr.PlayerMovement(collision.CollisionAttribute.InteractsWith);
+        attribute.SetEntityToIgnore(pawn, 0);
+
+        filter->QueryAttribute     = attribute;
+        filter->Vtable             = (CTraceFilterVTableDescriptor*) CTraceFilterPlayerMovementCS_vtable;
+        filter->m_bIterateEntities = true;
 
         var origin       = mv->AbsOrigin;
         var groundOrigin = origin;
         groundOrigin.Z -= 2.0f;
 
-        var trace = stackalloc GameTrace[1];
+        var trace = stackalloc CGameTrace[1];
 
-        TracePlayerBBox(&origin, &groundOrigin, &bbox, filter, trace);
+        TracePlayerBBox(&origin, &groundOrigin, bbox, filter, trace);
 
-        if (Math.Abs(trace->Fraction - 1.0f) < float.Epsilon)
+        if (trace->Fraction == 1.0f)
         {
             goto original;
         }
@@ -581,14 +585,14 @@ public class RampFix : IModSharpModule
             groundOrigin   =  origin;
             groundOrigin.Z -= 2.0f;
 
-            TracePlayerBBox(&origin, &groundOrigin, &bbox, filter, trace);
+            TracePlayerBBox(&origin, &groundOrigin, bbox, filter, trace);
 
             if (trace->StartInSolid)
             {
                 goto original;
             }
 
-            if (Math.Abs(trace->Fraction - 1.0f)                      < float.Epsilon
+            if (trace->Fraction                                       == 1.0f
                 || LastValidPlaneNormal[slot].Dot(trace->PlaneNormal) >= RAMP_BUG_THRESHOLD)
             {
                 mv->AbsOrigin = origin;
